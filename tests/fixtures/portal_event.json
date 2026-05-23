@@ -1,0 +1,6 @@
+{
+  "source": "portal",
+  "event_type": "deadline_elapsed",
+  "summary": "No response after status deadline",
+  "content_text": "Calendar deadline elapsed with no substantive agency response."
+}
