@@ -11,12 +11,25 @@ from pydantic import BaseModel
 
 from prr_pressure_cooker.ids import utc_now
 from prr_pressure_cooker.models import (
+    ApprovalInteractionRecord,
+    AttachmentIndexRecord,
     CaseEvent,
+    CaseExternalRefRecord,
     CaseRecord,
+    CaseStateRecord,
+    ContactIndexRecord,
+    DeadlineRecord,
+    DeadlineStatus,
     EscalationDecision,
     EvidenceRef,
     HumanApprovalTask,
     KanbanCard,
+    MessageIndexRecord,
+    PacketArtifactRecord,
+    RouteAuditRecord,
+    ThreadIndexRecord,
+    WorkflowExecutionRecord,
+    WorkflowExecutionStatus,
 )
 
 
@@ -62,6 +75,28 @@ class Store:
                     data_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS case_external_refs (
+                    normalized_ref TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    ref_type TEXT NOT NULL,
+                    ref_value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS case_states (
+                    case_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    pending_task_id TEXT,
+                    latest_event_id TEXT,
+                    latest_event_summary TEXT,
+                    pressure_score INTEGER NOT NULL,
+                    active_deadline_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS evidence_refs (
                     evidence_id TEXT PRIMARY KEY,
                     case_id TEXT NOT NULL,
@@ -71,6 +106,64 @@ class Store:
                     sha256 TEXT NOT NULL,
                     mime_type TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS message_indexes (
+                    message_index_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    message_id TEXT,
+                    in_reply_to TEXT,
+                    references_json TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    sender_name TEXT,
+                    sender_address TEXT,
+                    recipients_json TEXT NOT NULL,
+                    cc_json TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    snippet TEXT NOT NULL,
+                    attachment_evidence_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS thread_indexes (
+                    thread_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    first_event_id TEXT NOT NULL,
+                    latest_event_id TEXT NOT NULL,
+                    first_received_at TEXT NOT NULL,
+                    latest_received_at TEXT NOT NULL,
+                    participants_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS attachment_indexes (
+                    attachment_index_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    parent_evidence_id TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS contact_indexes (
+                    contact_index_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    name TEXT,
+                    address TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
 
@@ -135,8 +228,310 @@ class Store:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS workflow_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    workflow_name TEXT NOT NULL,
+                    backend TEXT NOT NULL DEFAULT 'local',
+                    status TEXT NOT NULL,
+                    latest_event_id TEXT,
+                    root_execution_id TEXT,
+                    run_id TEXT,
+                    remote_status TEXT,
+                    data_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS deadlines (
+                    deadline_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    source_event_id TEXT,
+                    kind TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS route_audits (
+                    audit_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    decision_id TEXT,
+                    pathway TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS packet_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL,
+                    pathway TEXT NOT NULL,
+                    artifact_type TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS approval_interactions (
+                    interaction_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL,
+                    choice TEXT NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            self._ensure_columns(
+                conn,
+                "workflow_executions",
+                {
+                    "backend": "TEXT NOT NULL DEFAULT 'local'",
+                    "root_execution_id": "TEXT",
+                    "run_id": "TEXT",
+                    "remote_status": "TEXT",
+                    "data_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+            )
+
+    def _ensure_columns(
+        self, conn: sqlite3.Connection, table: str, columns: dict[str, str]
+    ) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    def save_message_index(self, record: MessageIndexRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO message_indexes
+                (message_index_id, case_id, event_id, evidence_id, thread_id, message_id,
+                 in_reply_to, references_json, subject, sender_name, sender_address,
+                 recipients_json, cc_json, received_at, snippet, attachment_evidence_ids_json,
+                 created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.message_index_id,
+                    record.case_id,
+                    record.event_id,
+                    record.evidence_id,
+                    record.thread_id,
+                    record.message_id,
+                    record.in_reply_to,
+                    _json(record.references),
+                    record.subject,
+                    record.sender_name,
+                    record.sender_address,
+                    _json(record.recipients),
+                    _json(record.cc),
+                    record.received_at.isoformat(),
+                    record.snippet,
+                    _json(record.attachment_evidence_ids),
+                    record.created_at.isoformat(),
+                ),
+            )
+
+    def list_message_indexes(self, case_id: str) -> list[MessageIndexRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM message_indexes
+                WHERE case_id = ?
+                ORDER BY received_at, event_id, message_index_id
+                """,
+                (case_id,),
+            ).fetchall()
+        return [
+            MessageIndexRecord(
+                message_index_id=row["message_index_id"],
+                case_id=row["case_id"],
+                event_id=row["event_id"],
+                evidence_id=row["evidence_id"],
+                thread_id=row["thread_id"],
+                message_id=row["message_id"],
+                in_reply_to=row["in_reply_to"],
+                references=_loads(row["references_json"], []),
+                subject=row["subject"],
+                sender_name=row["sender_name"],
+                sender_address=row["sender_address"],
+                recipients=_loads(row["recipients_json"], []),
+                cc=_loads(row["cc_json"], []),
+                received_at=_dt(row["received_at"]),
+                snippet=row["snippet"],
+                attachment_evidence_ids=_loads(row["attachment_evidence_ids_json"], []),
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_thread_index(self, record: ThreadIndexRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO thread_indexes
+                (thread_id, case_id, subject, message_count, first_event_id, latest_event_id,
+                 first_received_at, latest_received_at, participants_json, created_at,
+                 updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.thread_id,
+                    record.case_id,
+                    record.subject,
+                    record.message_count,
+                    record.first_event_id,
+                    record.latest_event_id,
+                    record.first_received_at.isoformat(),
+                    record.latest_received_at.isoformat(),
+                    _json(record.participants),
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+
+    def list_thread_indexes(self, case_id: str) -> list[ThreadIndexRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM thread_indexes
+                WHERE case_id = ?
+                ORDER BY latest_received_at, thread_id
+                """,
+                (case_id,),
+            ).fetchall()
+        return [
+            ThreadIndexRecord(
+                thread_id=row["thread_id"],
+                case_id=row["case_id"],
+                subject=row["subject"],
+                message_count=row["message_count"],
+                first_event_id=row["first_event_id"],
+                latest_event_id=row["latest_event_id"],
+                first_received_at=_dt(row["first_received_at"]),
+                latest_received_at=_dt(row["latest_received_at"]),
+                participants=_loads(row["participants_json"], []),
+                created_at=_dt(row["created_at"]),
+                updated_at=_dt(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_attachment_index(self, record: AttachmentIndexRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO attachment_indexes
+                (attachment_index_id, case_id, event_id, parent_evidence_id, evidence_id,
+                 filename, mime_type, size_bytes, sha256, stored_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.attachment_index_id,
+                    record.case_id,
+                    record.event_id,
+                    record.parent_evidence_id,
+                    record.evidence_id,
+                    record.filename,
+                    record.mime_type,
+                    record.size_bytes,
+                    record.sha256,
+                    record.stored_path,
+                    record.created_at.isoformat(),
+                ),
+            )
+
+    def list_attachment_indexes(self, case_id: str) -> list[AttachmentIndexRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM attachment_indexes
+                WHERE case_id = ?
+                ORDER BY created_at, filename, attachment_index_id
+                """,
+                (case_id,),
+            ).fetchall()
+        return [
+            AttachmentIndexRecord(
+                attachment_index_id=row["attachment_index_id"],
+                case_id=row["case_id"],
+                event_id=row["event_id"],
+                parent_evidence_id=row["parent_evidence_id"],
+                evidence_id=row["evidence_id"],
+                filename=row["filename"],
+                mime_type=row["mime_type"],
+                size_bytes=row["size_bytes"],
+                sha256=row["sha256"],
+                stored_path=row["stored_path"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_contact_index(self, record: ContactIndexRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO contact_indexes
+                (contact_index_id, case_id, event_id, role, name, address, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.contact_index_id,
+                    record.case_id,
+                    record.event_id,
+                    record.role,
+                    record.name,
+                    record.address,
+                    record.created_at.isoformat(),
+                ),
+            )
+
+    def list_contact_indexes(self, case_id: str) -> list[ContactIndexRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM contact_indexes
+                WHERE case_id = ?
+                ORDER BY created_at, role, address, contact_index_id
+                """,
+                (case_id,),
+            ).fetchall()
+        return [
+            ContactIndexRecord(
+                contact_index_id=row["contact_index_id"],
+                case_id=row["case_id"],
+                event_id=row["event_id"],
+                role=row["role"],
+                name=row["name"],
+                address=row["address"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def clear_casefile_indexes(self, case_id: str) -> int:
+        tables = (
+            "message_indexes",
+            "thread_indexes",
+            "attachment_indexes",
+            "contact_indexes",
+        )
+        deleted = 0
+        with self.connect() as conn:
+            for table in tables:
+                cursor = conn.execute(f"DELETE FROM {table} WHERE case_id = ?", (case_id,))
+                deleted += cursor.rowcount
+        return deleted
 
     def upsert_case(self, case: CaseRecord) -> None:
         with self.connect() as conn:
@@ -160,6 +555,23 @@ class Store:
                     case.created_at.isoformat(),
                     case.updated_at.isoformat(),
                     _json(case.data),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO case_states
+                (case_id, status, pending_task_id, latest_event_id, latest_event_summary,
+                 pressure_score, active_deadline_count, updated_at, data_json)
+                VALUES (?, ?, NULL, NULL, NULL, 0, 0, ?, ?)
+                ON CONFLICT(case_id) DO UPDATE SET
+                  status=excluded.status,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    case.case_id,
+                    case.status,
+                    case.updated_at.isoformat(),
+                    _json({}),
                 ),
             )
 
@@ -200,6 +612,137 @@ class Store:
                     (f"{prefix}%",),
                 ).fetchall()
         return [self.get_case(row["case_id"]) for row in rows]
+
+    def save_case_external_ref(self, record: CaseExternalRefRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO case_external_refs
+                (normalized_ref, case_id, ref_type, ref_value, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_ref) DO UPDATE SET
+                  source=excluded.source,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    record.normalized_ref,
+                    record.case_id,
+                    record.ref_type,
+                    record.ref_value,
+                    record.source,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+
+    def get_case_external_ref(self, normalized_ref: str) -> CaseExternalRefRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM case_external_refs WHERE normalized_ref = ?",
+                (normalized_ref,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CaseExternalRefRecord(
+            normalized_ref=row["normalized_ref"],
+            case_id=row["case_id"],
+            ref_type=row["ref_type"],
+            ref_value=row["ref_value"],
+            source=row["source"],
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
+        )
+
+    def find_case_by_external_refs(self, normalized_refs: Iterable[str]) -> str | None:
+        refs = list(dict.fromkeys(normalized_refs))
+        if not refs:
+            return None
+        placeholders = ",".join("?" for _ in refs)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT case_id FROM case_external_refs
+                WHERE normalized_ref IN ({placeholders})
+                ORDER BY updated_at DESC, normalized_ref
+                LIMIT 1
+                """,
+                refs,
+            ).fetchone()
+        return str(row["case_id"]) if row else None
+
+    def list_case_external_refs(self, case_id: str) -> list[CaseExternalRefRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM case_external_refs
+                WHERE case_id = ?
+                ORDER BY ref_type, ref_value
+                """,
+                (case_id,),
+            ).fetchall()
+        return [
+            CaseExternalRefRecord(
+                normalized_ref=row["normalized_ref"],
+                case_id=row["case_id"],
+                ref_type=row["ref_type"],
+                ref_value=row["ref_value"],
+                source=row["source"],
+                created_at=_dt(row["created_at"]),
+                updated_at=_dt(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_case_state(self, record: CaseStateRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO case_states
+                (case_id, status, pending_task_id, latest_event_id, latest_event_summary,
+                 pressure_score, active_deadline_count, updated_at, data_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(case_id) DO UPDATE SET
+                  status=excluded.status,
+                  pending_task_id=excluded.pending_task_id,
+                  latest_event_id=excluded.latest_event_id,
+                  latest_event_summary=excluded.latest_event_summary,
+                  pressure_score=excluded.pressure_score,
+                  active_deadline_count=excluded.active_deadline_count,
+                  updated_at=excluded.updated_at,
+                  data_json=excluded.data_json
+                """,
+                (
+                    record.case_id,
+                    record.status,
+                    record.pending_task_id,
+                    record.latest_event_id,
+                    record.latest_event_summary,
+                    record.pressure_score,
+                    record.active_deadline_count,
+                    record.updated_at.isoformat(),
+                    _json(record.data),
+                ),
+            )
+
+    def get_case_state(self, case_id: str) -> CaseStateRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM case_states WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CaseStateRecord(
+            case_id=row["case_id"],
+            status=row["status"],
+            pending_task_id=row["pending_task_id"],
+            latest_event_id=row["latest_event_id"],
+            latest_event_summary=row["latest_event_summary"],
+            pressure_score=row["pressure_score"],
+            active_deadline_count=row["active_deadline_count"],
+            updated_at=_dt(row["updated_at"]),
+            data=_loads(row["data_json"], {}),
+        )
 
     def save_evidence_ref(self, ref: EvidenceRef) -> None:
         with self.connect() as conn:
@@ -299,6 +842,19 @@ class Store:
             ).fetchall()
         return [self.get_event(case_id, row["event_id"]) for row in rows]
 
+    def latest_event(self, case_id: str) -> CaseEvent | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT event_id FROM events
+                WHERE case_id = ?
+                ORDER BY received_at DESC, event_id DESC
+                LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+        return self.get_event(case_id, row["event_id"]) if row else None
+
     def save_decision(self, decision: EscalationDecision) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -327,6 +883,44 @@ class Store:
                     decision.created_at.isoformat(),
                 ),
             )
+
+    def get_decision(self, decision_id: str) -> EscalationDecision:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"decision not found: {decision_id}")
+        return EscalationDecision(
+            decision_id=row["decision_id"],
+            case_id=row["case_id"],
+            source_event_id=row["source_event_id"],
+            pathway=row["pathway"],
+            issue_tags=_loads(row["issue_tags_json"], []),
+            pressure_score=row["pressure_score"],
+            current_state=row["current_state"],
+            recommended_next_state=row["recommended_next_state"],
+            draft_type=row["draft_type"],
+            human_approval_required=bool(row["human_approval_required"]),
+            due_at=_dt(row["due_at"]) if row["due_at"] else None,
+            evidence_refs=_loads(row["evidence_refs_json"], []),
+            risk_level=row["risk_level"],
+            rationale=row["rationale"],
+            created_at=_dt(row["created_at"]),
+        )
+
+    def latest_decision(self, case_id: str) -> EscalationDecision | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT decision_id FROM decisions
+                WHERE case_id = ?
+                ORDER BY created_at DESC, decision_id DESC
+                LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+        return self.get_decision(row["decision_id"]) if row else None
 
     def save_task(self, task: HumanApprovalTask) -> None:
         with self.connect() as conn:
@@ -438,3 +1032,344 @@ class Store:
         with self.connect() as conn:
             cursor = conn.execute("DELETE FROM kanban_cards WHERE case_id = ?", (case_id,))
             return cursor.rowcount
+
+    def save_workflow_execution(self, record: WorkflowExecutionRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_executions
+                (execution_id, case_id, workflow_name, backend, status, latest_event_id,
+                 root_execution_id, run_id, remote_status, data_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(execution_id) DO UPDATE SET
+                  case_id=excluded.case_id,
+                  workflow_name=excluded.workflow_name,
+                  backend=excluded.backend,
+                  status=excluded.status,
+                  latest_event_id=excluded.latest_event_id,
+                  root_execution_id=excluded.root_execution_id,
+                  run_id=excluded.run_id,
+                  remote_status=excluded.remote_status,
+                  data_json=excluded.data_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    record.execution_id,
+                    record.case_id,
+                    record.workflow_name,
+                    record.backend,
+                    record.status,
+                    record.latest_event_id,
+                    record.root_execution_id,
+                    record.run_id,
+                    record.remote_status,
+                    _json(record.data),
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+
+    def list_workflow_executions(
+        self,
+        case_id: str | None = None,
+        *,
+        workflow_name: str | None = None,
+        status: WorkflowExecutionStatus | str | None = None,
+        backend: str | None = None,
+    ) -> list[WorkflowExecutionRecord]:
+        clauses = []
+        params: list[Any] = []
+        if case_id is not None:
+            clauses.append("case_id = ?")
+            params.append(case_id)
+        if workflow_name is not None:
+            clauses.append("workflow_name = ?")
+            params.append(workflow_name)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status))
+        if backend is not None:
+            clauses.append("backend = ?")
+            params.append(backend)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM workflow_executions
+                {where}
+                ORDER BY
+                  CASE status WHEN 'active' THEN 0 WHEN 'started' THEN 1 ELSE 2 END,
+                  CASE backend WHEN 'mistral' THEN 0 ELSE 1 END,
+                  updated_at DESC,
+                  execution_id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [self._workflow_execution_from_row(row) for row in rows]
+
+    def get_workflow_execution_for_case(
+        self,
+        case_id: str,
+        *,
+        workflow_name: str | None = None,
+        status: WorkflowExecutionStatus | str | None = None,
+        backend: str | None = None,
+    ) -> WorkflowExecutionRecord | None:
+        records = self.list_workflow_executions(
+            case_id,
+            workflow_name=workflow_name,
+            status=status,
+            backend=backend,
+        )
+        return records[0] if records else None
+
+    def get_active_workflow_execution_for_case(
+        self,
+        case_id: str,
+        *,
+        workflow_name: str | None = None,
+        backend: str | None = None,
+    ) -> WorkflowExecutionRecord | None:
+        return self.get_workflow_execution_for_case(
+            case_id,
+            workflow_name=workflow_name,
+            status=WorkflowExecutionStatus.ACTIVE,
+            backend=backend,
+        )
+
+    def _workflow_execution_from_row(self, row: sqlite3.Row) -> WorkflowExecutionRecord:
+        return WorkflowExecutionRecord(
+            execution_id=row["execution_id"],
+            case_id=row["case_id"],
+            workflow_name=row["workflow_name"],
+            backend=row["backend"],
+            status=row["status"],
+            latest_event_id=row["latest_event_id"],
+            root_execution_id=row["root_execution_id"],
+            run_id=row["run_id"],
+            remote_status=row["remote_status"],
+            data=_loads(row["data_json"], {}),
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
+        )
+
+    def save_deadline(self, deadline: DeadlineRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO deadlines
+                (deadline_id, case_id, source_event_id, kind, due_at, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(deadline_id) DO UPDATE SET
+                  status=excluded.status
+                """,
+                (
+                    deadline.deadline_id,
+                    deadline.case_id,
+                    deadline.source_event_id,
+                    deadline.kind,
+                    deadline.due_at.isoformat(),
+                    deadline.status,
+                    deadline.created_at.isoformat(),
+                ),
+            )
+
+    def list_deadlines(
+        self, case_id: str | None = None, status: str | None = None
+    ) -> list[DeadlineRecord]:
+        conditions: list[str] = []
+        params: list[str] = []
+        if case_id:
+            conditions.append("case_id = ?")
+            params.append(case_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM deadlines {where} ORDER BY due_at, deadline_id", params
+            ).fetchall()
+        return [
+            DeadlineRecord(
+                deadline_id=row["deadline_id"],
+                case_id=row["case_id"],
+                source_event_id=row["source_event_id"],
+                kind=row["kind"],
+                due_at=_dt(row["due_at"]),
+                status=row["status"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def due_deadlines(self, now: datetime) -> list[DeadlineRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM deadlines
+                WHERE status = ? AND due_at <= ?
+                ORDER BY due_at, deadline_id
+                """,
+                (DeadlineStatus.OPEN.value, now.isoformat()),
+            ).fetchall()
+        return [
+            DeadlineRecord(
+                deadline_id=row["deadline_id"],
+                case_id=row["case_id"],
+                source_event_id=row["source_event_id"],
+                kind=row["kind"],
+                due_at=_dt(row["due_at"]),
+                status=row["status"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def set_deadline_status(self, deadline_id: str, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE deadlines SET status = ? WHERE deadline_id = ?",
+                (status, deadline_id),
+            )
+
+    def cancel_open_deadlines_for_case(self, case_id: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE deadlines
+                SET status = ?
+                WHERE case_id = ? AND status = ?
+                """,
+                (DeadlineStatus.CANCELED.value, case_id, DeadlineStatus.OPEN.value),
+            )
+            return cursor.rowcount
+
+    def save_route_audit(self, audit: RouteAuditRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO route_audits
+                (audit_id, case_id, event_id, decision_id, pathway, status, created_at,
+                 data_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit.audit_id,
+                    audit.case_id,
+                    audit.event_id,
+                    audit.decision_id,
+                    audit.pathway,
+                    audit.status,
+                    audit.created_at.isoformat(),
+                    _json(audit.data),
+                ),
+            )
+
+    def list_route_audits(self, case_id: str | None = None) -> list[RouteAuditRecord]:
+        if case_id:
+            query = "SELECT * FROM route_audits WHERE case_id = ? ORDER BY created_at"
+            params = (case_id,)
+        else:
+            query = "SELECT * FROM route_audits ORDER BY created_at"
+            params = ()
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            RouteAuditRecord(
+                audit_id=row["audit_id"],
+                case_id=row["case_id"],
+                event_id=row["event_id"],
+                decision_id=row["decision_id"],
+                pathway=row["pathway"],
+                status=row["status"],
+                created_at=_dt(row["created_at"]),
+                data=_loads(row["data_json"], {}),
+            )
+            for row in rows
+        ]
+
+    def save_packet_artifact(self, artifact: PacketArtifactRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO packet_artifacts
+                (artifact_id, case_id, decision_id, pathway, artifact_type, file_path,
+                 created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.artifact_id,
+                    artifact.case_id,
+                    artifact.decision_id,
+                    artifact.pathway,
+                    artifact.artifact_type,
+                    artifact.file_path,
+                    artifact.created_at.isoformat(),
+                ),
+            )
+
+    def list_packet_artifacts(self, case_id: str | None = None) -> list[PacketArtifactRecord]:
+        if case_id:
+            query = "SELECT * FROM packet_artifacts WHERE case_id = ? ORDER BY created_at"
+            params = (case_id,)
+        else:
+            query = "SELECT * FROM packet_artifacts ORDER BY created_at"
+            params = ()
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            PacketArtifactRecord(
+                artifact_id=row["artifact_id"],
+                case_id=row["case_id"],
+                decision_id=row["decision_id"],
+                pathway=row["pathway"],
+                artifact_type=row["artifact_type"],
+                file_path=row["file_path"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def save_approval_interaction(self, interaction: ApprovalInteractionRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO approval_interactions
+                (interaction_id, case_id, task_id, decision_id, choice, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction.interaction_id,
+                    interaction.case_id,
+                    interaction.task_id,
+                    interaction.decision_id,
+                    interaction.choice,
+                    interaction.note,
+                    interaction.created_at.isoformat(),
+                ),
+            )
+
+    def list_approval_interactions(
+        self, case_id: str | None = None
+    ) -> list[ApprovalInteractionRecord]:
+        if case_id:
+            query = "SELECT * FROM approval_interactions WHERE case_id = ? ORDER BY created_at"
+            params = (case_id,)
+        else:
+            query = "SELECT * FROM approval_interactions ORDER BY created_at"
+            params = ()
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            ApprovalInteractionRecord(
+                interaction_id=row["interaction_id"],
+                case_id=row["case_id"],
+                task_id=row["task_id"],
+                decision_id=row["decision_id"],
+                choice=row["choice"],
+                note=row["note"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
+        ]

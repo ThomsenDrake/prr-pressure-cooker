@@ -70,6 +70,33 @@ def test_custodian_dodge_routes_forced_position_letter():
     assert decision.draft_type == "forced_agency_position_letter"
 
 
+def test_exemption_vagueness_routes_withholding_matrix():
+    evt = event("Some records are exempt and will not be released.")
+    classification = classify_event(evt, case())
+    decision = compute_decision(case(), evt, classification, None)
+
+    assert decision.pathway == "exemption_vagueness"
+    assert decision.draft_type == "withholding_exemption_matrix"
+
+
+def test_duplicate_inflation_routes_count_audit():
+    evt = event("The search produced many duplicate messages and unique email counts vary.")
+    classification = classify_event(evt, case())
+    decision = compute_decision(case(), evt, classification, None)
+
+    assert decision.pathway == "duplicate_inflation"
+    assert decision.draft_type == "duplicate_inflation_audit"
+
+
+def test_public_interest_signal_routes_public_pressure_packet():
+    evt = event("A commissioner asked for a public interest update on this request.")
+    classification = classify_event(evt, case())
+    decision = compute_decision(case(), evt, classification, None)
+
+    assert decision.pathway == "public_pressure"
+    assert decision.draft_type == "commissioner_reporter_one_pager"
+
+
 def test_no_action_for_plain_status_update():
     evt = event("We have received your request and are continuing to process it.")
     classification = classify_event(evt, case())
@@ -203,6 +230,20 @@ def test_osceola_closure_warning_remains_closure_threat():
     decision = compute_decision(case(), evt, classification, None)
 
     assert decision.pathway == "closure_threat"
+
+
+def test_waiting_for_payment_closed_notice_routes_closure_threat():
+    evt = event(
+        "The request has been in \"Waiting for Payment\" status for 30 days. "
+        "The Osceola County Sheriff's Office considers this request closed. "
+        "If you would still like the records, please submit another PUBLIC RECORD REQUEST."
+    )
+    classification = classify_event(evt, case())
+    decision = compute_decision(case(), evt, classification, None)
+
+    assert classification.contains_closure_warning is True
+    assert decision.pathway == "closure_threat"
+    assert decision.draft_type == "no_withdrawal_preservation_reply"
 
 
 def test_fee_line_parses_hours_plus_minutes():

@@ -5,7 +5,7 @@ description = "Mistral Workflows-first pressure ladder for public records reques
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mistralai-workflows[mistralai]>=0.0.1",
+    "mistralai-workflows[mistralai]>=3.0.0,<4",
     "pydantic>=2.11",
     "pyyaml>=6.0.2",
 ]

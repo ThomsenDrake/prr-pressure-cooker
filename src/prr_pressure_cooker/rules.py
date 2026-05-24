@@ -107,6 +107,8 @@ def classify_event(event: CaseEvent, case: CaseRecord) -> EventClassification:
         tags.append("duplicate_inflation")
     if event.event_type == "deadline_elapsed":
         tags.append("silence_delay")
+        if _has_any(text, ["section_11912_cure_window", "119.12", "cure window"]):
+            tags.append("post_notice_no_cure")
     if case.data.get("notice_11912_sent") and event.event_type == "deadline_elapsed":
         tags.append("post_notice_no_cure")
 
@@ -219,6 +221,65 @@ def compute_decision(
             now + timedelta(days=1),
         )
 
+    if "post_notice_no_cure" in tags:
+        return _decision(
+            case,
+            event,
+            Pathway.COUNSEL_OR_MEDIATION,
+            tags,
+            10,
+            "COUNSEL_PACKET_READY",
+            "attorney_faf_packet",
+            "Formal notice window appears elapsed without a complete cure.",
+            RiskLevel.HIGH,
+            now + timedelta(days=2),
+        )
+
+    if "exemption_vagueness" in tags:
+        return _decision(
+            case,
+            event,
+            Pathway.EXEMPTION_VAGUENESS,
+            tags,
+            6,
+            "WITHHOLDING_MATRIX_READY",
+            "withholding_exemption_matrix",
+            "Agency appears to assert exemptions without a clear statutory basis or "
+            "withholding explanation.",
+            RiskLevel.MEDIUM,
+            now + timedelta(days=5),
+        )
+
+    if "duplicate_inflation" in tags:
+        return _decision(
+            case,
+            event,
+            Pathway.DUPLICATE_INFLATION,
+            tags,
+            5,
+            "DUPLICATE_AUDIT_READY",
+            "duplicate_inflation_audit",
+            "Agency appears to rely on duplicate or inflated record counts that need "
+            "deduplication and counting support.",
+            RiskLevel.MEDIUM,
+            now + timedelta(days=5),
+        )
+
+    if classification.public_interest_signal:
+        return _decision(
+            case,
+            event,
+            Pathway.PUBLIC_PRESSURE,
+            tags | {"public_interest_signal"},
+            4,
+            "PUBLIC_PRESSURE_PACKET_READY",
+            "commissioner_reporter_one_pager",
+            "The event contains public-interest, press, or commissioner context that "
+            "may support a public pressure packet.",
+            RiskLevel.LOW,
+            now + timedelta(days=7),
+        )
+
     if audit and (audit.math_defect or audit.alternatives_appear_cumulative):
         defect_tags = {"defective_estimate"}
         if audit.total_does_not_reconcile:
@@ -267,20 +328,6 @@ def compute_decision(
             "position on agency-held records.",
             RiskLevel.MEDIUM,
             now + timedelta(days=5),
-        )
-
-    if "post_notice_no_cure" in tags:
-        return _decision(
-            case,
-            event,
-            Pathway.COUNSEL_OR_MEDIATION,
-            tags,
-            10,
-            "COUNSEL_PACKET_READY",
-            "attorney_faf_packet",
-            "Formal notice window appears elapsed without a complete cure.",
-            RiskLevel.HIGH,
-            now + timedelta(days=2),
         )
 
     if "silence_delay" in tags:
@@ -480,7 +527,10 @@ def _contains_unresolved_closure_threat(text: str) -> bool:
             "closed if payment",
             "administratively close",
             "we will consider this request closed",
+            "considers this request closed",
             "your request will be closed",
+            "request has been in \"waiting for payment\" status",
+            "submit another public record request",
         ],
     )
 
