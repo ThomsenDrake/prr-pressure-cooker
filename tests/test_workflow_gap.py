@@ -14,6 +14,7 @@ from prr_pressure_cooker.ingest import import_path
 from prr_pressure_cooker.models import (
     ApprovalRecordInput,
     CaseEvent,
+    CaseEventStepInput,
     CaseWorkflowInput,
     CaseWorkflowSignal,
     ReviewAssistantInput,
@@ -24,11 +25,13 @@ from prr_pressure_cooker.models import (
     RouteEventInput,
 )
 from prr_pressure_cooker.service import (
+    CASE_EVENT_STEP_WORKFLOW_NAME,
     _clean_request_summary,
     _natural_language_request_summary,
     apply_review_choice,
     create_deadline,
     get_case_status,
+    process_case_event_step,
     resolve_case_workflow,
     review_task_prompt,
     review_task_queue,
@@ -39,7 +42,11 @@ from prr_pressure_cooker.service import (
 from prr_pressure_cooker.storage import Store
 from prr_pressure_cooker.workflows import discover_workflows
 from prr_pressure_cooker.workflows import router as workflow_router
-from prr_pressure_cooker.workflows.router import PRREscalationRouter, PRRReviewAssistantWorkflow
+from prr_pressure_cooker.workflows.router import (
+    PRRCaseEventStepWorkflow,
+    PRREscalationRouter,
+    PRRReviewAssistantWorkflow,
+)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -105,6 +112,40 @@ def test_workflow_signal_records_execution_status_and_artifacts(tmp_path: Path):
         "index:contacts",
     }
     assert len(store.list_route_audits("demo")) == 1
+
+
+def test_case_event_step_is_idempotent_and_db_backed(tmp_path: Path):
+    settings = _settings(tmp_path)
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    event = import_path("demo", Path("tests/fixtures/defective_estimate.txt"), store, settings)[0]
+    input_data = CaseEventStepInput(
+        case_id="demo",
+        signal=CaseWorkflowSignal(event_id=event.event_id, signal_type="agency_event"),
+        execution_id="wf_step_demo",
+        backend="local",
+        remote_status="COMPLETED",
+    )
+
+    first = process_case_event_step(input_data, store, settings)
+    second = process_case_event_step(input_data, store, settings)
+
+    workflow = store.get_workflow_execution("wf_step_demo")
+    commands = store.list_case_command_runs("demo", command_type="case_event")
+    state = store.get_case_state("demo")
+    assert first["idempotent_replay"] is False
+    assert second["idempotent_replay"] is True
+    assert len(commands) == 1
+    assert commands[0].status == "succeeded"
+    assert workflow is not None
+    assert workflow.workflow_name == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert workflow.status == "succeeded"
+    assert workflow.latest_event_id == event.event_id
+    assert len(store.list_route_audits("demo")) == 1
+    assert len(store.list_tasks(status="pending", case_id="demo")) == 1
+    assert state is not None
+    assert state.latest_event_id == event.event_id
+    assert second["status"]["pending_task_id"] == state.pending_task_id
 
 
 def test_review_choice_updates_task_and_records_interaction(tmp_path: Path):
@@ -496,7 +537,12 @@ def test_deadline_scan_emits_and_routes_elapsed_events(tmp_path: Path):
 def test_workflow_discovery_finds_router_and_case_lifecycle():
     names = {workflow_class.__name__ for workflow_class in discover_workflows()}
 
-    assert {"PRREscalationRouter", "CaseLifecycleWorkflow", "PRRReviewAssistantWorkflow"} <= names
+    assert {
+        "PRREscalationRouter",
+        "PRRCaseEventStepWorkflow",
+        "CaseLifecycleWorkflow",
+        "PRRReviewAssistantWorkflow",
+    } <= names
 
 
 def test_required_workflow_activities_are_registered():
@@ -514,6 +560,7 @@ def test_required_workflow_activities_are_registered():
         "get_review_task_queue_activity",
         "reconcile_case_activity",
         "mark_case_workflow_resolved_activity",
+        "process_case_event_step_activity",
         "signal_approval_reply_activity",
     }
 
@@ -550,6 +597,29 @@ def test_router_workflow_runs_non_interactive_activity_pipeline(tmp_path: Path, 
     assert result["status"] == "waiting_for_human_review"
     assert result["pathway"] == "defective_estimate"
     assert len(Store(settings.db_path).list_tasks(status="pending", case_id="demo")) == 1
+
+
+def test_case_event_step_workflow_runs_bounded_command(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PRR_DB_PATH", str(tmp_path / "prr.db"))
+    monkeypatch.setenv("PRR_CASEFILES_DIR", str(tmp_path / "casefiles"))
+    settings = Settings.from_env()
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    event = import_path("demo", Path("tests/fixtures/defective_estimate.txt"), store, settings)[0]
+
+    result = asyncio.run(
+        workflows.execute_workflow(
+            PRRCaseEventStepWorkflow,
+            CaseEventStepInput(
+                case_id="demo",
+                signal=CaseWorkflowSignal(event_id=event.event_id),
+            ),
+        )
+    )
+
+    assert result["status"]["latest_event_id"] == event.event_id
+    assert result["route"]["status"] == "waiting_for_human_review"
+    assert Store(settings.db_path).list_case_command_runs("demo", command_type="case_event")
 
 
 def test_case_lifecycle_workflow_accepts_approval_reply_signal(monkeypatch):
@@ -1367,9 +1437,49 @@ def test_ingest_push_cli_imports_fixture_and_signals_workflow(tmp_path: Path, mo
 
     assert payload["case_id"] == "demo"
     assert payload["imported"]
-    assert payload["signaled"][0]["result"]["status"] == "waiting_for_human_review"
-    assert Store(settings.db_path).get_workflow_execution_for_case("demo") is not None
+    assert payload["signaled"][0]["route"]["status"] == "waiting_for_human_review"
+    assert payload["signaled"][0]["workflow"]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert Store(settings.db_path).get_workflow_execution_for_case(
+        "demo", workflow_name=CASE_EVENT_STEP_WORKFLOW_NAME
+    ) is not None
     assert len(Store(settings.db_path).list_tasks(status="pending", case_id="demo")) == 1
+
+
+def test_workflow_process_event_cli_runs_step_workflow(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("PRR_DB_PATH", str(tmp_path / "prr.db"))
+    monkeypatch.setenv("PRR_CASEFILES_DIR", str(tmp_path / "casefiles"))
+    settings = Settings.from_env()
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    event = import_path("demo", Path("tests/fixtures/defective_estimate.txt"), store, settings)[0]
+
+    parser = build_parser()
+    args = parser.parse_args(["workflow", "process-event", "demo", "--event", event.event_id])
+    args.func(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["backend"] == "local"
+    assert payload["workflow"]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert payload["workflow"]["status"] == "succeeded"
+    assert payload["status"]["latest_event_id"] == event.event_id
+    assert len(Store(settings.db_path).list_case_command_runs("demo")) == 1
+
+
+def test_ingest_push_step_mode_processes_event_step(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("PRR_DB_PATH", str(tmp_path / "prr.db"))
+    monkeypatch.setenv("PRR_CASEFILES_DIR", str(tmp_path / "casefiles"))
+    settings = Settings.from_env()
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+
+    parser = build_parser()
+    args = parser.parse_args(["ingest-push", "demo", "tests/fixtures/defective_estimate.txt"])
+    args.func(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["signaled"][0]["workflow"]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert payload["signaled"][0]["workflow"]["status"] == "succeeded"
+    assert len(Store(settings.db_path).list_case_command_runs("demo")) == 1
 
 
 def test_manual_resolution_marks_case_resolved_and_closes_local_state(tmp_path: Path):

@@ -54,8 +54,19 @@ class ReviewNoteDisposition(StrEnum):
 class WorkflowExecutionStatus(StrEnum):
     STARTED = "started"
     ACTIVE = "active"
+    SUCCEEDED = "succeeded"
     RESOLVED = "resolved"
     FAILED = "failed"
+    CANCELED = "canceled"
+    SUPERSEDED = "superseded"
+
+
+class CaseCommandRunStatus(StrEnum):
+    STARTED = "started"
+    ACTIVE = "active"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
 
 
 class DeadlineStatus(StrEnum):
@@ -275,6 +286,22 @@ class WorkflowExecutionRecord(BaseModel):
     updated_at: datetime
 
 
+class CaseCommandRunRecord(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    command_id: str
+    case_id: str
+    command_type: str
+    idempotency_key: str
+    workflow_execution_id: str | None = None
+    status: CaseCommandRunStatus = CaseCommandRunStatus.STARTED
+    input_data: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class RouteAuditRecord(BaseModel):
     audit_id: str
     case_id: str
@@ -415,6 +442,16 @@ class CaseWorkflowSignal(BaseModel):
     event_id: str
     signal_type: str = "agency_event"
     event_payload: PushedEventPayload | None = None
+
+
+class CaseEventStepInput(BaseModel):
+    case_id: str
+    signal: CaseWorkflowSignal
+    execution_id: str | None = None
+    root_execution_id: str | None = None
+    run_id: str | None = None
+    backend: str | None = None
+    remote_status: str | None = None
 
 
 class CaseWorkflowStatus(BaseModel):

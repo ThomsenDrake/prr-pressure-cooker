@@ -20,10 +20,13 @@ from prr_pressure_cooker.ingest import (
 from prr_pressure_cooker.models import (
     ApprovalInteractionRecord,
     ApprovalRecordInput,
+    CaseCommandRunStatus,
     CaseEvent,
+    CaseEventStepInput,
     CaseRecord,
     CaseStateRecord,
     CaseStatus,
+    CaseWorkflowSignal,
     CaseWorkflowStatus,
     DeadlineRecord,
     DeadlineStatus,
@@ -65,6 +68,7 @@ RESOLVABLE_PATHWAYS = {
     Pathway.FEE_OPACITY,
 }
 CASE_WORKFLOW_NAME = "case-lifecycle-workflow"
+CASE_EVENT_STEP_WORKFLOW_NAME = "prr-case-event-step"
 
 
 def route_event(case_id: str, event_id: str, store: Store, settings: Settings) -> RouteEventResult:
@@ -594,6 +598,154 @@ def signal_case_event(case_id: str, event_id: str, store: Store, settings: Setti
         "workflow": updated_record.model_dump(mode="json"),
         "result": result.model_dump(mode="json"),
     }
+
+
+def case_event_step_idempotency_key(case_id: str, signal: CaseWorkflowSignal) -> str:
+    return f"{case_id}:{signal.signal_type}:{signal.event_id}"
+
+
+def process_case_event_step(
+    input_data: CaseEventStepInput,
+    store: Store,
+    settings: Settings,
+) -> dict:
+    input_data = CaseEventStepInput.model_validate(input_data)
+    signal = input_data.signal
+    idempotency_key = case_event_step_idempotency_key(input_data.case_id, signal)
+    workflow_record = _record_case_event_step_workflow(
+        input_data,
+        store,
+        settings,
+        WorkflowExecutionStatus.ACTIVE,
+        data={"idempotency_key": idempotency_key, "signal_type": signal.signal_type},
+    )
+    command, should_run = store.begin_case_command_run(
+        command_type="case_event",
+        case_id=input_data.case_id,
+        idempotency_key=idempotency_key,
+        input_data=input_data.model_dump(mode="json"),
+        workflow_execution_id=workflow_record.execution_id if workflow_record else None,
+    )
+    if not should_run and command.status == CaseCommandRunStatus.SUCCEEDED:
+        workflow_record = _record_case_event_step_workflow(
+            input_data,
+            store,
+            settings,
+            WorkflowExecutionStatus.SUCCEEDED,
+            latest_event_id=signal.event_id,
+            data={"idempotency_key": idempotency_key, "command_id": command.command_id},
+        )
+        return {
+            "case_id": input_data.case_id,
+            "event_id": signal.event_id,
+            "idempotent_replay": True,
+            "command": command.model_dump(mode="json"),
+            "workflow": workflow_record.model_dump(mode="json") if workflow_record else None,
+            **command.result,
+        }
+
+    try:
+        persisted_event = None
+        if signal.event_payload is not None:
+            persisted_event = persist_pushed_event_payload(signal.event_payload, store, settings)
+        result = route_event(input_data.case_id, signal.event_id, store, settings)
+        reconciliation = reconcile_case_state(
+            input_data.case_id,
+            store,
+            settings,
+            execution_id=input_data.execution_id,
+            backend=input_data.backend or "local",
+            root_execution_id=input_data.root_execution_id,
+            run_id=input_data.run_id,
+            remote_status=input_data.remote_status,
+        )
+        status = get_case_status(input_data.case_id, store)
+        result_payload = {
+            "route": result.model_dump(mode="json"),
+            "reconciliation": reconciliation,
+            "status": status.model_dump(mode="json"),
+            "persisted_event_id": persisted_event.event_id if persisted_event else None,
+        }
+    except Exception as exc:
+        store.mark_case_command_run_failed(command.command_id, str(exc))
+        _record_case_event_step_workflow(
+            input_data,
+            store,
+            settings,
+            WorkflowExecutionStatus.FAILED,
+            latest_event_id=signal.event_id,
+            data={"idempotency_key": idempotency_key, "error": str(exc)},
+        )
+        raise
+
+    succeeded_command = store.mark_case_command_run_succeeded(
+        command.command_id, result_payload
+    )
+    succeeded_workflow = _record_case_event_step_workflow(
+        input_data,
+        store,
+        settings,
+        WorkflowExecutionStatus.SUCCEEDED,
+        latest_event_id=signal.event_id,
+        data={
+            "idempotency_key": idempotency_key,
+            "command_id": succeeded_command.command_id,
+            "route_status": result.status,
+        },
+    )
+    return {
+        "case_id": input_data.case_id,
+        "event_id": signal.event_id,
+        "idempotent_replay": False,
+        "command": succeeded_command.model_dump(mode="json"),
+        "workflow": succeeded_workflow.model_dump(mode="json") if succeeded_workflow else None,
+        **result_payload,
+    }
+
+
+def _record_case_event_step_workflow(
+    input_data: CaseEventStepInput,
+    store: Store,
+    settings: Settings,
+    status: WorkflowExecutionStatus,
+    *,
+    latest_event_id: str | None = None,
+    data: dict | None = None,
+) -> WorkflowExecutionRecord | None:
+    if input_data.execution_id is None:
+        return None
+    now = utc_now()
+    existing = store.get_workflow_execution(input_data.execution_id)
+    if existing:
+        record = existing.model_copy(
+            update={
+                "status": status,
+                "latest_event_id": latest_event_id or existing.latest_event_id,
+                "root_execution_id": input_data.root_execution_id
+                or existing.root_execution_id,
+                "run_id": input_data.run_id or existing.run_id,
+                "remote_status": input_data.remote_status or existing.remote_status,
+                "data": {**existing.data, **(data or {})},
+                "updated_at": now,
+            }
+        )
+    else:
+        record = WorkflowExecutionRecord(
+            execution_id=input_data.execution_id,
+            case_id=input_data.case_id,
+            workflow_name=CASE_EVENT_STEP_WORKFLOW_NAME,
+            backend=input_data.backend or settings.workflow_backend or "local",
+            status=status,
+            latest_event_id=latest_event_id,
+            root_execution_id=input_data.root_execution_id,
+            run_id=input_data.run_id,
+            remote_status=input_data.remote_status,
+            data=data or {},
+            created_at=now,
+            updated_at=now,
+        )
+    store.save_workflow_execution(record)
+    return record
 
 
 def resolve_case_workflow(

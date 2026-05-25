@@ -16,6 +16,7 @@ try:
         from prr_pressure_cooker.config import Settings
         from prr_pressure_cooker.models import (
             ApprovalRecordInput,
+            CaseEventStepInput,
             CaseWorkflowInput,
             CaseWorkflowSignal,
             CaseWorkflowStatus,
@@ -29,6 +30,7 @@ try:
             RouteEventResult,
         )
         from prr_pressure_cooker.service import (
+            CASE_EVENT_STEP_WORKFLOW_NAME,
             CASE_WORKFLOW_NAME,
             apply_review_record_if_pending,
             audit_fee_payload,
@@ -42,6 +44,7 @@ try:
             mark_case_workflow_resolved,
             persist_event_payload,
             persist_pushed_event_payload,
+            process_case_event_step,
             reconcile_case_state,
             reroute_case,
             resolve_case_workflow,
@@ -214,6 +217,13 @@ if workflows is not None:
         store = Store(settings.db_path)
         event = persist_pushed_event_payload(signal.event_payload, store, settings)
         return {"persisted": True, "event_id": event.event_id}
+
+    @workflows.activity()
+    async def process_case_event_step_activity(input_data: CaseEventStepInput) -> dict:
+        input_data = CaseEventStepInput.model_validate(input_data)
+        settings = Settings.from_env()
+        store = Store(settings.db_path)
+        return process_case_event_step(input_data, store, settings)
 
     @workflows.activity()
     async def get_case_status_activity(input_data: CaseWorkflowInput) -> dict:
@@ -513,6 +523,26 @@ if workflows is not None:
             }
         )
 
+    def _with_current_event_step_execution(input_data: CaseEventStepInput) -> CaseEventStepInput:
+        if input_data.execution_id:
+            return input_data
+        try:
+            info = temporalio.workflow.info()
+        except Exception:
+            return input_data
+        execution_id = getattr(info, "workflow_id", None)
+        if not execution_id:
+            return input_data
+        return input_data.model_copy(
+            update={
+                "execution_id": execution_id,
+                "root_execution_id": execution_id,
+                "run_id": getattr(info, "run_id", None),
+                "backend": "mistral",
+                "remote_status": "RUNNING",
+            }
+        )
+
     async def route_case_event_with_activities(input_data: RouteEventInput) -> dict:
         input_data = RouteEventInput.model_validate(input_data)
         payload = RouteEvaluationPayload.model_validate(await load_case_activity(input_data))
@@ -541,6 +571,21 @@ if workflows is not None:
         async def run(self, input_data: RouteEventInput) -> dict:
             input_data = RouteEventInput.model_validate(input_data)
             return await route_case_event_with_activities(input_data)
+
+    @workflows.workflow.define(
+        name=CASE_EVENT_STEP_WORKFLOW_NAME,
+        workflow_display_name="PRR Case Event Step",
+        workflow_description=(
+            "Processes one PRR case event against durable case state and then completes."
+        ),
+        execution_timeout=timedelta(hours=1),
+    )
+    class PRRCaseEventStepWorkflow:
+        @workflows.workflow.entrypoint
+        async def run(self, input_data: CaseEventStepInput) -> dict:
+            input_data = CaseEventStepInput.model_validate(input_data)
+            input_data = _with_current_event_step_execution(input_data)
+            return await process_case_event_step_activity(input_data)
 
     @workflows.workflow.define(
         name="case-lifecycle-workflow",
@@ -1093,6 +1138,7 @@ if workflows is not None:
 
     WORKFLOW_CLASSES = [
         PRREscalationRouter,
+        PRRCaseEventStepWorkflow,
         CaseLifecycleWorkflow,
         PRRReviewAssistantWorkflow,
     ]

@@ -8,18 +8,28 @@ from mistralai.client import Mistral
 from prr_pressure_cooker.config import Settings
 from prr_pressure_cooker.ids import content_id, utc_now
 from prr_pressure_cooker.models import (
+    CaseCommandRunStatus,
+    CaseEventStepInput,
     CaseWorkflowInput,
     CaseWorkflowSignal,
     CaseWorkflowStatus,
+    PushedEventPayload,
     WorkflowExecutionRecord,
     WorkflowExecutionStatus,
 )
-from prr_pressure_cooker.service import CASE_WORKFLOW_NAME, get_case_status
+from prr_pressure_cooker.service import (
+    CASE_EVENT_STEP_WORKFLOW_NAME,
+    CASE_WORKFLOW_NAME,
+    case_event_step_idempotency_key,
+    get_case_status,
+)
 from prr_pressure_cooker.storage import Store
 
 
 class WorkflowRuntime(Protocol):
     def start_case(self, case_id: str, *, force_new: bool = False) -> dict[str, Any]: ...
+
+    def process_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]: ...
 
     def signal_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]: ...
 
@@ -40,9 +50,35 @@ class LocalWorkflowRuntime:
         return {"backend": "local", "workflow": record.model_dump(mode="json")}
 
     def signal_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]:
+        if _is_step_mode(self.settings):
+            return self.process_event(case_id, signal)
         from prr_pressure_cooker.service import signal_case_event
 
         result = signal_case_event(case_id, signal.event_id, self.store, self.settings)
+        return {"backend": "local", **result}
+
+    def process_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]:
+        from prr_pressure_cooker.service import process_case_event_step
+
+        execution_id = content_id(
+            "wf",
+            self.settings.deployment_name,
+            CASE_EVENT_STEP_WORKFLOW_NAME,
+            case_id,
+            signal.event_id,
+            signal.signal_type,
+        )
+        result = process_case_event_step(
+            CaseEventStepInput(
+                case_id=case_id,
+                signal=signal,
+                execution_id=execution_id,
+                backend="local",
+                remote_status="COMPLETED",
+            ),
+            self.store,
+            self.settings,
+        )
         return {"backend": "local", **result}
 
     def resolve_case(self, case_id: str) -> dict[str, Any]:
@@ -116,6 +152,8 @@ class MistralWorkflowRuntime:
         }
 
     def signal_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]:
+        if _is_step_mode(self.settings):
+            return self.process_event(case_id, signal)
         record = self._active_case_workflow(case_id)
         if record is None:
             record = self._find_remote_case_workflow(case_id)
@@ -171,6 +209,102 @@ class MistralWorkflowRuntime:
             "restarted_stale_workflow": restarted_stale_workflow,
         }
 
+    def process_event(self, case_id: str, signal: CaseWorkflowSignal) -> dict[str, Any]:
+        idempotency_key = case_event_step_idempotency_key(case_id, signal)
+        remote_signal = _remote_safe_signal(signal)
+        existing_command = self.store.get_case_command_run_by_idempotency(
+            "case_event",
+            idempotency_key,
+        )
+        if existing_command and existing_command.status in {
+            CaseCommandRunStatus.STARTED,
+            CaseCommandRunStatus.ACTIVE,
+            CaseCommandRunStatus.SUCCEEDED,
+        }:
+            status = get_case_status(case_id, self.store)
+            workflow = (
+                self.store.get_workflow_execution(existing_command.workflow_execution_id)
+                if existing_command.workflow_execution_id
+                else None
+            )
+            return {
+                "backend": "mistral",
+                "workflow": workflow.model_dump(mode="json") if workflow else None,
+                "command": existing_command.model_dump(mode="json"),
+                "status": status.model_dump(mode="json"),
+                "remote": None,
+                "idempotent_replay": True,
+            }
+
+        requested_execution_id = content_id(
+            "wf",
+            self.settings.deployment_name,
+            CASE_EVENT_STEP_WORKFLOW_NAME,
+            case_id,
+            signal.event_id,
+            signal.signal_type,
+        )
+        command, _should_run = self.store.begin_case_command_run(
+            command_type="case_event",
+            case_id=case_id,
+            idempotency_key=idempotency_key,
+            input_data=CaseEventStepInput(case_id=case_id, signal=remote_signal).model_dump(
+                mode="json"
+            ),
+            workflow_execution_id=requested_execution_id,
+        )
+        try:
+            response = self.client.workflows.execute_workflow(
+                workflow_identifier=CASE_EVENT_STEP_WORKFLOW_NAME,
+                execution_id=requested_execution_id,
+                input=CaseEventStepInput(case_id=case_id, signal=remote_signal).model_dump(
+                    mode="json"
+                ),
+                deployment_name=self.settings.deployment_name,
+                server_url=self.settings.workflow_api_base_url,
+            )
+        except Exception as exc:
+            self.store.mark_case_command_run_failed(command.command_id, str(exc))
+            raise
+        response_data = _model_dump(response)
+        execution_id = _remote_execution_id(response_data, requested_execution_id)
+        now = utc_now()
+        record = WorkflowExecutionRecord(
+            execution_id=execution_id,
+            case_id=case_id,
+            workflow_name=CASE_EVENT_STEP_WORKFLOW_NAME,
+            backend="mistral",
+            status=WorkflowExecutionStatus.ACTIVE,
+            latest_event_id=signal.event_id,
+            root_execution_id=_optional_str(response_data.get("root_execution_id")),
+            run_id=_optional_str(response_data.get("run_id")),
+            remote_status=_optional_str(response_data.get("status")),
+            data={
+                "requested_execution_id": requested_execution_id,
+                "idempotency_key": idempotency_key,
+                "workflow_mode": "step",
+                "signal_type": signal.signal_type,
+                "payload_shrunk": remote_signal != signal,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        self.store.save_workflow_execution(record)
+        command = command.model_copy(
+            update={
+                "workflow_execution_id": execution_id,
+                "updated_at": now,
+            }
+        )
+        self.store.save_case_command_run(command)
+        return {
+            "backend": "mistral",
+            "workflow": record.model_dump(mode="json"),
+            "command": command.model_dump(mode="json"),
+            "remote": response_data,
+            "idempotent_replay": False,
+        }
+
     def resolve_case(self, case_id: str) -> dict[str, Any]:
         record = self._active_case_workflow(case_id)
         if record is None:
@@ -201,6 +335,19 @@ class MistralWorkflowRuntime:
         }
 
     def status(self, case_id: str) -> dict[str, Any]:
+        if _is_step_mode(self.settings):
+            status = get_case_status(case_id, self.store)
+            workflows = [
+                record.model_dump(mode="json")
+                for record in self.store.list_workflow_executions(case_id)[:10]
+            ]
+            return {
+                "backend": "mistral",
+                "workflow": workflows[0] if workflows else None,
+                "workflows": workflows,
+                "status": status.model_dump(mode="json"),
+                "remote": None,
+            }
         record = self._active_case_workflow(case_id)
         if record is None:
             record = self._find_remote_case_workflow(case_id)
@@ -319,6 +466,33 @@ def workflow_runtime(
     if selected == "mistral":
         return MistralWorkflowRuntime(store, settings)
     raise ValueError(f"unsupported workflow backend: {selected}")
+
+
+def _is_step_mode(settings: Settings) -> bool:
+    return settings.workflow_mode.lower() == "step"
+
+
+def _remote_safe_signal(
+    signal: CaseWorkflowSignal, max_chars: int = 1_800_000
+) -> CaseWorkflowSignal:
+    if signal.event_payload is None:
+        return signal
+    step_input = CaseEventStepInput(
+        case_id=signal.event_payload.event.case_id,
+        signal=signal,
+    )
+    if len(step_input.model_dump_json()) <= max_chars:
+        return signal
+    event = signal.event_payload.event.model_copy(update={"evidence_refs": []})
+    return CaseWorkflowSignal(
+        event_id=signal.event_id,
+        signal_type=signal.signal_type,
+        event_payload=PushedEventPayload(
+            event=event,
+            case=signal.event_payload.case,
+            evidence=[],
+        ),
+    )
 
 
 def _signal_name(signal_type: str) -> str:

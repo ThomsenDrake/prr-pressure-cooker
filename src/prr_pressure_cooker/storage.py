@@ -9,10 +9,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from prr_pressure_cooker.ids import utc_now
+from prr_pressure_cooker.ids import content_id, utc_now
 from prr_pressure_cooker.models import (
     ApprovalInteractionRecord,
     AttachmentIndexRecord,
+    CaseCommandRunRecord,
+    CaseCommandRunStatus,
     CaseEvent,
     CaseExternalRefRecord,
     CaseRecord,
@@ -242,6 +244,21 @@ class Store:
                     data_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS case_command_runs (
+                    command_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    command_type TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    workflow_execution_id TEXT,
+                    status TEXT NOT NULL,
+                    input_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(command_type, idempotency_key)
                 );
 
                 CREATE TABLE IF NOT EXISTS deadlines (
@@ -1069,6 +1086,14 @@ class Store:
                 ),
             )
 
+    def get_workflow_execution(self, execution_id: str) -> WorkflowExecutionRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM workflow_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        return self._workflow_execution_from_row(row) if row else None
+
     def list_workflow_executions(
         self,
         case_id: str | None = None,
@@ -1149,6 +1174,182 @@ class Store:
             run_id=row["run_id"],
             remote_status=row["remote_status"],
             data=_loads(row["data_json"], {}),
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
+        )
+
+    def begin_case_command_run(
+        self,
+        *,
+        command_type: str,
+        case_id: str,
+        idempotency_key: str,
+        input_data: dict[str, Any],
+        workflow_execution_id: str | None = None,
+    ) -> tuple[CaseCommandRunRecord, bool]:
+        existing = self.get_case_command_run_by_idempotency(command_type, idempotency_key)
+        if existing and existing.status == CaseCommandRunStatus.SUCCEEDED:
+            return existing, False
+
+        now = utc_now()
+        if existing:
+            updated = existing.model_copy(
+                update={
+                    "case_id": case_id,
+                    "status": CaseCommandRunStatus.ACTIVE,
+                    "input_data": input_data,
+                    "workflow_execution_id": workflow_execution_id
+                    or existing.workflow_execution_id,
+                    "error": None,
+                    "updated_at": now,
+                }
+            )
+            self.save_case_command_run(updated)
+            return updated, True
+
+        record = CaseCommandRunRecord(
+            command_id=content_id("cmd", command_type, idempotency_key),
+            case_id=case_id,
+            command_type=command_type,
+            idempotency_key=idempotency_key,
+            workflow_execution_id=workflow_execution_id,
+            status=CaseCommandRunStatus.ACTIVE,
+            input_data=input_data,
+            created_at=now,
+            updated_at=now,
+        )
+        self.save_case_command_run(record)
+        return record, True
+
+    def save_case_command_run(self, record: CaseCommandRunRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO case_command_runs
+                (command_id, case_id, command_type, idempotency_key, workflow_execution_id,
+                 status, input_json, result_json, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(command_id) DO UPDATE SET
+                  case_id=excluded.case_id,
+                  command_type=excluded.command_type,
+                  idempotency_key=excluded.idempotency_key,
+                  workflow_execution_id=excluded.workflow_execution_id,
+                  status=excluded.status,
+                  input_json=excluded.input_json,
+                  result_json=excluded.result_json,
+                  error=excluded.error,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    record.command_id,
+                    record.case_id,
+                    record.command_type,
+                    record.idempotency_key,
+                    record.workflow_execution_id,
+                    record.status,
+                    _json(record.input_data),
+                    _json(record.result),
+                    record.error,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+
+    def get_case_command_run(self, command_id: str) -> CaseCommandRunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM case_command_runs WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        return self._case_command_run_from_row(row) if row else None
+
+    def get_case_command_run_by_idempotency(
+        self, command_type: str, idempotency_key: str
+    ) -> CaseCommandRunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM case_command_runs
+                WHERE command_type = ? AND idempotency_key = ?
+                """,
+                (command_type, idempotency_key),
+            ).fetchone()
+        return self._case_command_run_from_row(row) if row else None
+
+    def list_case_command_runs(
+        self,
+        case_id: str | None = None,
+        *,
+        command_type: str | None = None,
+        status: CaseCommandRunStatus | str | None = None,
+    ) -> list[CaseCommandRunRecord]:
+        clauses = []
+        params: list[Any] = []
+        if case_id is not None:
+            clauses.append("case_id = ?")
+            params.append(case_id)
+        if command_type is not None:
+            clauses.append("command_type = ?")
+            params.append(command_type)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM case_command_runs
+                {where}
+                ORDER BY updated_at DESC, command_id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [self._case_command_run_from_row(row) for row in rows]
+
+    def mark_case_command_run_succeeded(
+        self, command_id: str, result: dict[str, Any]
+    ) -> CaseCommandRunRecord:
+        record = self.get_case_command_run(command_id)
+        if record is None:
+            raise KeyError(f"case command run not found: {command_id}")
+        updated = record.model_copy(
+            update={
+                "status": CaseCommandRunStatus.SUCCEEDED,
+                "result": result,
+                "error": None,
+                "updated_at": utc_now(),
+            }
+        )
+        self.save_case_command_run(updated)
+        return updated
+
+    def mark_case_command_run_failed(
+        self, command_id: str, error: str
+    ) -> CaseCommandRunRecord:
+        record = self.get_case_command_run(command_id)
+        if record is None:
+            raise KeyError(f"case command run not found: {command_id}")
+        updated = record.model_copy(
+            update={
+                "status": CaseCommandRunStatus.FAILED,
+                "error": error,
+                "updated_at": utc_now(),
+            }
+        )
+        self.save_case_command_run(updated)
+        return updated
+
+    def _case_command_run_from_row(self, row: sqlite3.Row) -> CaseCommandRunRecord:
+        return CaseCommandRunRecord(
+            command_id=row["command_id"],
+            case_id=row["case_id"],
+            command_type=row["command_type"],
+            idempotency_key=row["idempotency_key"],
+            workflow_execution_id=row["workflow_execution_id"],
+            status=row["status"],
+            input_data=_loads(row["input_json"], {}),
+            result=_loads(row["result_json"], {}),
+            error=row["error"],
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )

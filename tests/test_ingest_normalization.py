@@ -1,4 +1,8 @@
-from prr_pressure_cooker.ingest import html_to_text, strip_quoted_history
+from prr_pressure_cooker.ingest import (
+    extract_case_external_refs,
+    html_to_text,
+    strip_quoted_history,
+)
 
 
 def test_html_to_text_skips_styles_and_keeps_body():
@@ -20,3 +24,15 @@ def test_strip_quoted_history_removes_prior_thread():
 
     assert "This acknowledges receipt." in text
     assert "Original request text" not in text
+
+
+def test_extract_case_external_refs_handles_records_center_ids():
+    refs = extract_case_external_refs(
+        "[Records Center] PUBLIC RECORD REQUEST :: P041212-031826",
+        "Public Records Request - General :: R052454-022226",
+    )
+
+    assert {ref["normalized_ref"] for ref in refs} == {
+        "records-center:p041212-031826",
+        "records-center:r052454-022226",
+    }

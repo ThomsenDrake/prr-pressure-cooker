@@ -141,6 +141,12 @@ def extract_case_external_refs(*texts: str) -> list[dict[str, str]]:
             lambda match: match.group(1).upper(),
             lambda match: f"mycusthelp:{match.group(1).lower()}",
         ),
+        (
+            "records_center",
+            re.compile(r"\b([PR][0-9]{6}-[0-9]{6})\b", re.IGNORECASE),
+            lambda match: match.group(1).upper(),
+            lambda match: f"records-center:{match.group(1).lower()}",
+        ),
     ]
     refs: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -612,7 +618,7 @@ def _extract_attachment_indexes(
     for index, part in enumerate(message.iter_attachments(), start=1):
         filename = part.get_filename() or f"attachment-{index}.bin"
         payload = part.get_payload(decode=True)
-        data = payload if payload is not None else part.get_content().encode("utf-8")
+        data = payload if payload is not None else _attachment_content_bytes(part)
         sha = hashlib.sha256(data).hexdigest()
         evidence_id = content_id(
             "evi",
@@ -654,6 +660,17 @@ def _extract_attachment_indexes(
         )
         attachment_ids.append(evidence_id)
     return attachment_ids
+
+
+def _attachment_content_bytes(part) -> bytes:
+    content = part.get_content()
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, bytearray):
+        return bytes(content)
+    if hasattr(content, "as_bytes"):
+        return content.as_bytes(policy=policy.default)
+    return str(content).encode("utf-8")
 
 
 def _extract_structured_attachment_indexes(

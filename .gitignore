@@ -18,5 +18,6 @@ htmlcov/
 *.sqlite3
 casefiles/
 var/
+.artifacts/
 dist/
 build/

@@ -28,6 +28,7 @@ def test_koyeb_deploy_command_shape(capsys):
     assert "--archive-ignore-dir var" in output
     assert "PRR_DB_PATH=/data/prr.db" in output
     assert "PRR_CASEFILES_DIR=/data/casefiles" in output
+    assert "PRR_WORKFLOW_MODE=step" in output
 
 
 def test_koyeb_deploy_command_can_wait(capsys):
@@ -98,6 +99,20 @@ def test_case_id_derivation_handles_portal_request_numbers():
             "allmail-records",
         )
         == "allmail-records-corr-2026-300"
+    )
+    assert (
+        _case_id_from_envelope(
+            {"id": "3", "subject": "[Records Center] PUBLIC RECORD REQUEST :: P041212-031826"},
+            "allmail-records",
+        )
+        == "allmail-records-p041212-031826"
+    )
+    assert (
+        _case_id_from_envelope(
+            {"id": "4", "subject": "Re: Request for oversight regarding Scout records request"},
+            "allmail-records",
+        )
+        == "allmail-records-unknown-agency-request-for-oversight-regarding-scout-records-request"
     )
 
 

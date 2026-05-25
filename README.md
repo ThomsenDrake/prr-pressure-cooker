@@ -40,24 +40,26 @@ also stored as child evidence refs under the immutable raw evidence tree.
 
 ## Workflow And Deadline Commands
 
-Start or inspect the durable case workflow record:
+Process or inspect durable case state:
 
 ```bash
-uv run prr workflow start-case demo
-uv run prr workflow signal-event demo --event <event_id>
+uv run prr workflow process-event demo --event <event_id>
 uv run prr workflow status demo
 uv run prr workflow resolve-case demo
 ```
 
 Use `--backend mistral` or set `PRR_WORKFLOW_BACKEND=mistral` when the command
-should start, signal, or query the hosted Mistral Workflow execution instead of the
-local SQLite-backed shim. `PRR_WORKFLOW_API_BASE_URL` can override the default
-Mistral API URL for both the worker and local signaling client. Hosted
-`signal-event` and `ingest-push` calls include the event payload and raw evidence
-needed for the Koyeb worker to create the case, persist evidence, and route the
-event from its `/data` store.
+should start a hosted Mistral step workflow instead of the local SQLite-backed
+shim. `PRR_WORKFLOW_API_BASE_URL` can override the default Mistral API URL for
+both the worker and local client. Hosted `process-event` and `ingest-push` calls
+include the event payload and raw evidence needed for the Koyeb worker to create
+the case, persist evidence, and route the event from its `/data` store.
 
-`signal-event` routes the imported event, records a route audit, creates any pending human-review task, and refreshes the workflow status query state. `ingest-push` is the tailnet/Koyeb handoff command for raw evidence that has already been exported from Proton/Himalaya:
+`process-event` starts a bounded event-step workflow that routes the imported
+event, records a route audit, creates any pending human-review task, reconciles
+durable case state, and then completes. `ingest-push` is the tailnet/Koyeb
+handoff command for raw evidence that has already been exported from
+Proton/Himalaya:
 
 ```bash
 MISTRAL_API_KEY=... DEPLOYMENT_NAME=prr-pressure-cooker-prod \

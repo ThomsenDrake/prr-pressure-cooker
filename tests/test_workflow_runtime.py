@@ -14,16 +14,19 @@ from prr_pressure_cooker.ingest import import_path
 from prr_pressure_cooker.models import (
     CaseEvent,
     CaseWorkflowSignal,
+    PushedEventPayload,
+    PushedEvidence,
     WorkflowExecutionRecord,
     WorkflowExecutionStatus,
 )
 from prr_pressure_cooker.service import (
+    CASE_EVENT_STEP_WORKFLOW_NAME,
     persist_pushed_event_payload,
     route_event,
     start_case_workflow,
 )
 from prr_pressure_cooker.storage import Store
-from prr_pressure_cooker.workflow_runtime import MistralWorkflowRuntime
+from prr_pressure_cooker.workflow_runtime import MistralWorkflowRuntime, workflow_runtime
 
 
 class FakeResponse(BaseModel):
@@ -102,6 +105,18 @@ def _settings(tmp_path: Path) -> Settings:
         casefiles_dir=tmp_path / "casefiles",
         deployment_name="prr-pressure-cooker-prod",
         workflow_backend="mistral",
+        workflow_mode="lifecycle",
+        workflow_api_base_url="https://workflow.example.test",
+    )
+
+
+def _step_settings(tmp_path: Path, backend: str = "local") -> Settings:
+    return Settings(
+        db_path=tmp_path / "prr.db",
+        casefiles_dir=tmp_path / "casefiles",
+        deployment_name="prr-pressure-cooker-prod",
+        workflow_backend=backend,
+        workflow_mode="step",
         workflow_api_base_url="https://workflow.example.test",
     )
 
@@ -190,6 +205,25 @@ def test_start_case_workflow_can_record_remote_lifecycle_execution(tmp_path: Pat
     assert selected.data["source"] == "case_lifecycle_entrypoint"
 
 
+def test_local_runtime_step_mode_processes_event_without_lifecycle_workflow(tmp_path: Path):
+    settings = _step_settings(tmp_path)
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    event = import_path("demo", Path("tests/fixtures/defective_estimate.txt"), store, settings)[0]
+
+    result = workflow_runtime(store, settings).signal_event(
+        "demo",
+        CaseWorkflowSignal(event_id=event.event_id, signal_type="agency_event"),
+    )
+
+    workflows = store.list_workflow_executions("demo")
+    assert result["backend"] == "local"
+    assert result["workflow"]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert result["workflow"]["status"] == "succeeded"
+    assert {workflow.workflow_name for workflow in workflows} == {CASE_EVENT_STEP_WORKFLOW_NAME}
+    assert store.get_case_state("demo").latest_event_id == event.event_id
+
+
 def test_mistral_runtime_starts_signals_and_queries_remote_workflow(tmp_path: Path):
     settings = _settings(tmp_path)
     store = Store(settings.db_path)
@@ -209,6 +243,7 @@ def test_mistral_runtime_starts_signals_and_queries_remote_workflow(tmp_path: Pa
         casefiles_dir=tmp_path / "fresh-casefiles",
         deployment_name="prr-pressure-cooker-prod",
         workflow_backend="mistral",
+        workflow_mode="lifecycle",
         workflow_api_base_url="https://workflow.example.test",
     )
     fresh_status = MistralWorkflowRuntime(
@@ -237,6 +272,85 @@ def test_mistral_runtime_starts_signals_and_queries_remote_workflow(tmp_path: Pa
     assert status["status"]["case_id"] == "demo"
     assert fresh_status["workflow"]["execution_id"] == started["workflow"]["execution_id"]
     assert fresh_status["status"]["case_id"] == "demo"
+
+
+def test_mistral_runtime_step_mode_executes_event_step_and_reads_db_status(tmp_path: Path):
+    settings = _step_settings(tmp_path, backend="mistral")
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    fake_client = FakeMistral()
+    runtime = MistralWorkflowRuntime(store, settings, client=fake_client)
+
+    signaled = runtime.signal_event(
+        "demo",
+        CaseWorkflowSignal(event_id="evt_demo", signal_type="agency_event"),
+    )
+    duplicate = runtime.signal_event(
+        "demo",
+        CaseWorkflowSignal(event_id="evt_demo", signal_type="agency_event"),
+    )
+    status = runtime.status("demo")
+
+    executed = fake_client.workflows.executed[0]
+    assert signaled["backend"] == "mistral"
+    assert executed["workflow_identifier"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert executed["deployment_name"] == "prr-pressure-cooker-prod"
+    assert executed["input"]["case_id"] == "demo"
+    assert executed["input"]["signal"]["event_id"] == "evt_demo"
+    assert signaled["workflow"]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+    assert signaled["workflow"]["latest_event_id"] == "evt_demo"
+    assert signaled["command"]["status"] == "active"
+    assert duplicate["idempotent_replay"] is True
+    assert duplicate["command"]["workflow_execution_id"] == signaled["workflow"]["execution_id"]
+    assert len(fake_client.workflows.executed) == 1
+    assert fake_client.workflows.executions.signals == []
+    assert fake_client.workflows.executions.queries == []
+    assert status["remote"] is None
+    assert status["status"]["case_id"] == "demo"
+    assert status["workflows"][0]["workflow_name"] == CASE_EVENT_STEP_WORKFLOW_NAME
+
+
+def test_mistral_runtime_step_mode_strips_oversized_remote_evidence(tmp_path: Path):
+    settings = _step_settings(tmp_path, backend="mistral")
+    store = Store(settings.db_path)
+    store.create_case("demo", "Demo Agency", "Demo request")
+    event = CaseEvent(
+        event_id="evt_huge",
+        case_id="demo",
+        received_at=datetime(2026, 5, 24, tzinfo=UTC),
+        summary="Huge attachment",
+        content_text="Agency response with large attachment.",
+        evidence_refs=["evi_huge"],
+    )
+    store.save_event(event)
+    fake_client = FakeMistral()
+    runtime = MistralWorkflowRuntime(store, settings, client=fake_client)
+
+    runtime.process_event(
+        "demo",
+        CaseWorkflowSignal(
+            event_id=event.event_id,
+            event_payload=PushedEventPayload(
+                event=event,
+                case=store.get_case("demo"),
+                evidence=[
+                    PushedEvidence(
+                        evidence_id="evi_huge",
+                        original_path="huge.eml",
+                        stored_name="huge.eml",
+                        sha256="abc",
+                        mime_type="message/rfc822",
+                        size_bytes=2_000_000,
+                        content_b64="x" * 2_000_000,
+                    )
+                ],
+            ),
+        ),
+    )
+
+    sent_payload = fake_client.workflows.executed[0]["input"]["signal"]["event_payload"]
+    assert sent_payload["evidence"] == []
+    assert sent_payload["event"]["evidence_refs"] == []
 
 
 def test_mistral_runtime_signal_without_local_record_starts_fresh_execution(tmp_path: Path):

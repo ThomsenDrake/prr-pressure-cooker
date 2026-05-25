@@ -127,6 +127,23 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_signal.add_argument("--push-payload", action="store_true")
     workflow_signal.add_argument("--backend", choices=["local", "mistral"])
     workflow_signal.set_defaults(func=cmd_workflow_signal_event)
+    workflow_process = workflow_sub.add_parser("process-event")
+    workflow_process.add_argument("case_id")
+    workflow_process.add_argument("--event", required=True, dest="event_id")
+    workflow_process.add_argument(
+        "--signal",
+        default="agency_event",
+        choices=[
+            "agency_event",
+            "deadline_elapsed",
+            "human_reply",
+            "payment",
+            "records_release",
+        ],
+    )
+    workflow_process.add_argument("--push-payload", action="store_true")
+    workflow_process.add_argument("--backend", choices=["local", "mistral"])
+    workflow_process.set_defaults(func=cmd_workflow_process_event)
     workflow_status = workflow_sub.add_parser("status")
     workflow_status.add_argument("case_id")
     workflow_status.add_argument("--backend", choices=["local", "mistral"])
@@ -416,6 +433,25 @@ def cmd_workflow_signal_event(args) -> None:
     print(json.dumps(result, indent=2))
 
 
+def cmd_workflow_process_event(args) -> None:
+    store, settings = _store_settings()
+    selected_backend = args.backend or settings.workflow_backend
+    event_payload = (
+        build_pushed_event_payload(args.case_id, args.event_id, store)
+        if args.push_payload or selected_backend == "mistral"
+        else None
+    )
+    result = workflow_runtime(store, settings, args.backend).process_event(
+        args.case_id,
+        CaseWorkflowSignal(
+            event_id=args.event_id,
+            signal_type=args.signal,
+            event_payload=event_payload,
+        ),
+    )
+    print(json.dumps(result, indent=2))
+
+
 def cmd_workflow_status(args) -> None:
     store, settings = _store_settings()
     result = workflow_runtime(store, settings, args.backend).status(args.case_id)
@@ -550,6 +586,8 @@ def cmd_deploy_koyeb(args) -> None:
         "PRR_DB_PATH=/data/prr.db",
         "--env",
         "PRR_CASEFILES_DIR=/data/casefiles",
+        "--env",
+        "PRR_WORKFLOW_MODE=step",
     ]
     if args.wait:
         command.extend(["--wait", "--wait-timeout", args.wait_timeout])
@@ -591,13 +629,14 @@ def _resolve_case_id_from_envelope(envelope: dict, prefix: str, store: Store) ->
 
 
 def _case_id_from_envelope(envelope: dict, prefix: str) -> str:
-    subject = envelope.get("subject") or ""
+    subject = _case_subject_from_envelope(envelope)
     patterns = [
         (r"\bPRR[-\s]*([0-9]+)\b", lambda match: match.group(1)),
         (r"\bpublic records request #([0-9]+-[0-9]+)\b", lambda match: match.group(1)),
         (r"\brecords request ([A-Z]+-[0-9]+-[0-9]+)\b", lambda match: match.group(1)),
         (r"\b(CORR-[0-9]+-[0-9]+)\b", lambda match: match.group(1)),
         (r"\b(W[0-9]+-[0-9]+)\b", lambda match: match.group(1)),
+        (r"\b([PR][0-9]{6}-[0-9]{6})\b", lambda match: match.group(1)),
     ]
     for pattern, build_id in patterns:
         match = re.search(pattern, subject, flags=re.IGNORECASE)
@@ -605,3 +644,12 @@ def _case_id_from_envelope(envelope: dict, prefix: str) -> str:
             return f"{prefix}-{kebab_slug(build_id(match))}"
     sender = _agency_from_envelope(envelope)
     return kebab_slug(f"{prefix}-{sender}-{subject}", fallback=f"{prefix}-message-{envelope['id']}")
+
+
+def _case_subject_from_envelope(envelope: dict) -> str:
+    subject = envelope.get("subject") or ""
+    while True:
+        stripped = re.sub(r"^\s*(re|fw|fwd)\s*:\s*", "", subject, flags=re.IGNORECASE)
+        if stripped == subject:
+            return subject
+        subject = stripped

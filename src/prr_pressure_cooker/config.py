@@ -33,6 +33,7 @@ class Settings:
     himalaya_folder: str = "Folders/Public Records Requests"
     himalaya_account: str | None = None
     workflow_backend: str = "local"
+    workflow_mode: str = "step"
     workflow_api_base_url: str | None = None
     requester_emails: tuple[str, ...] = ("drake.t98@proton.me", "drake@draket.xyz")
 
@@ -50,6 +51,7 @@ class Settings:
             himalaya_folder=os.getenv("HIMALAYA_FOLDER", "Folders/Public Records Requests"),
             himalaya_account=os.getenv("HIMALAYA_ACCOUNT"),
             workflow_backend=os.getenv("PRR_WORKFLOW_BACKEND", "local"),
+            workflow_mode=os.getenv("PRR_WORKFLOW_MODE", "step"),
             workflow_api_base_url=os.getenv("PRR_WORKFLOW_API_BASE_URL"),
             requester_emails=tuple(
                 email.strip().lower()
